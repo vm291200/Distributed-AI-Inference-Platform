@@ -52,15 +52,21 @@ func main() {
 	log.Println("Worker started, waiting for messages...")
 
 	for {
-		msg, err := reader.ReadMessage(context.Background())
+		// FetchMessage reads the next message WITHOUT committing its offset
+		// (ReadMessage commits as it reads)
+		msg, err := reader.FetchMessage(context.Background())
 		if err != nil {
-			log.Printf("Error reading message: %v", err)
+			log.Printf("Error fetching message: %v", err)
 			continue
 		}
 
 		var request InferenceRequest
 		if err := json.Unmarshal(msg.Value, &request); err != nil {
 			log.Printf("Error parsing message: %v", err)
+			//This message will never parse.
+			if err := reader.CommitMessages(context.Background(), msg); err != nil {
+				log.Printf("Error committing offset for unparseable message: %v", err)
+			}
 			continue
 		}
 
@@ -78,7 +84,19 @@ func main() {
 
 		resultJSON, _ := json.Marshal(inferenceResult)
 		ctx := context.Background()
-		rdb.SetEX(ctx, fmt.Sprintf("request:%s", request.RequestID), string(resultJSON), 5*time.Minute)
+		//Write the result first. Only if succeeds do we commit offset.
+		if err := rdb.SetEX(ctx, fmt.Sprintf("request:%s", request.RequestID), string(resultJSON), 5*time.Minute).Err(); err != nil {
+			//Redis write failed. No committing, wo the message stays uncommitted and is redelivered
+			// after a restart.
+			log.Printf("Error writing to Redis for %s: %v (offset left uncommitted)", request.RequestID, err)
+			continue
+		}
+
+		//Result is safely in Redis, at this point mark the message as done.
+		if err := reader.CommitMessages(context.Background(), msg); err != nil {
+			log.Printf("Error committing offset for %s: %v", request.RequestID, err)
+			continue
+		}
 
 		log.Printf("Completed request: %s", request.RequestID)
 	}
