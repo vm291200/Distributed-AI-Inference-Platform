@@ -12,6 +12,8 @@ import (
 	kafka "github.com/segmentio/kafka-go"
 )
 
+const maxRedisRetries = 3
+
 type InferenceRequest struct {
 	RequestID string `json:"request_id"`
 	Prompt    string `json:"prompt"`
@@ -29,6 +31,27 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// writeResultWithRetry writes the result to Redis, retrying with backoff if the
+// write fails. Most write failures are transient, for example, like a brief Redis hiccup,
+// so a few retries usually recover without throwing away the work the worker just did.
+// Returns nil as soon as one attempt succeeds, or the last error if all fail.
+func writeResultWithRetry(ctx context.Context, rdb *redis.Client, key, value string) error {
+	var lastErr error
+	for attempt := 1; attempt <= maxRedisRetries; attempt++ {
+		lastErr = rdb.SetEX(ctx, key, value, 5*time.Minute).Err()
+		if lastErr == nil {
+			return nil //write succeeded
+		}
+		log.Printf("Redis write attempt %d/%d failed: %v", attempt, maxRedisRetries, lastErr)
+		if attempt < maxRedisRetries {
+			//Wait before the next try, and wait longer each time (200ms, 400ms).
+			//This gives Redis room to recover instead of hammering it.
+			time.Sleep(time.Duration(attempt*200) * time.Millisecond)
+		}
+	}
+	return lastErr
 }
 
 func main() {
@@ -64,8 +87,20 @@ func main() {
 		if err := json.Unmarshal(msg.Value, &request); err != nil {
 			log.Printf("Error parsing message: %v", err)
 			//This message will never parse.
+			//Committed so it does not re-read the same broker message on every restart
 			if err := reader.CommitMessages(context.Background(), msg); err != nil {
 				log.Printf("Error committing offset for unparseable message: %v", err)
+			}
+			continue
+		}
+
+		//Validate requred input fields. A message can be valid JSON but still be
+		//ususable (empty id or empty prompt). That's a permanent failure, not a
+		//transient one, so skip and commit rather than retry.
+		if request.RequestID == "" || request.Prompt == "" {
+			log.Printf("Invalid request (empty request_id or prompt), skipping: %s", string(msg.Value))
+			if err := reader.CommitMessages(context.Background(), msg); err != nil {
+				log.Printf("Error committing offset for invalid message: %v", err)
 			}
 			continue
 		}
@@ -83,12 +118,14 @@ func main() {
 		}
 
 		resultJSON, _ := json.Marshal(inferenceResult)
-		ctx := context.Background()
-		//Write the result first. Only if succeeds do we commit offset.
-		if err := rdb.SetEX(ctx, fmt.Sprintf("request:%s", request.RequestID), string(resultJSON), 5*time.Minute).Err(); err != nil {
-			//Redis write failed. No committing, wo the message stays uncommitted and is redelivered
-			// after a restart.
-			log.Printf("Error writing to Redis for %s: %v (offset left uncommitted)", request.RequestID, err)
+
+		key := fmt.Sprintf("request:%s", request.RequestID)
+		//Write the result first, with bounded retry. Only if it succeeds do we
+		//commit the offset
+		if err := writeResultWithRetry(context.Background(), rdb, key, string(resultJSON)); err != nil {
+			//Every retry failed. Do NOT commit, so the message stays uncommitted
+			//and is reprocessed after a restart (preserving at-least-once).
+			log.Printf("All Redis write attempts failed for %s (offset left uncommitted): %v", request.RequestID, err)
 			continue
 		}
 
