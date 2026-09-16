@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	kafka "github.com/segmentio/kafka-go"
 )
 
+// How many times to try the Redis write before giving up on a message
 const maxRedisRetries = 3
 
 type InferenceRequest struct {
@@ -31,6 +33,23 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// statusHealthServer runs a tiny HTTP server in the background so something
+// outside the worker (a container orchestrator, a load balancer, or just curl)
+// can check whether this worker is alive. The Kafka loop is not an HTTP server,
+// so without this there is no way to knock on the worker's door
+func statusHealthServer(port string) {
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ok","service":"worker"}`))
+	})
+	addr := ":" + port
+	//This blocks(it serves forever), which is why the caller runs it in a
+	//goroutine so the Kafka loop can keep running alongside it.
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		log.Printf("Health server error: %v", err)
+	}
 }
 
 // writeResultWithRetry writes the result to Redis, retrying with backoff if the
@@ -58,6 +77,12 @@ func main() {
 	kafkaBroker := getEnv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 	redisHost := getEnv("REDIS_HOST", "localhost")
 	redisPort := getEnv("REDIS_PORT", "6379")
+	healthPort := getEnv("WORKER_HEALTH_PORT", "8080")
+
+	//start the healthserver in the background. The main loop below keeps
+	//pulling from Kafka this serves health checks consurrently.
+	go statusHealthServer(healthPort)
+	log.Printf("Health server listening on: %s/healthz", healthPort)
 
 	rdb := redis.NewClient(&redis.Options{
 		Addr: fmt.Sprintf("%s:%s", redisHost, redisPort),
